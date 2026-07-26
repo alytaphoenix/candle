@@ -2451,3 +2451,30 @@ fn commands_concurrent_acquisition() {
 
     commands.wait_until_completed().unwrap();
 }
+
+// De-risk spike for wiring `kernel_mul_mm_id` (ggml's indexed matmul, used
+// for MoE expert dispatch -- see ratatoskr/DESIGN.md section 15 in the
+// yggdrasil monorepo for the full context). Confirms the kernel this whole
+// effort depends on actually loads as a Metal compute pipeline from the
+// compiled metallib, since it has `[[host_name]]` instantiations but (at
+// the time this test was added) zero Rust callers anywhere in this crate
+// or candle-core -- named kernels aren't dead-code-eliminated from the
+// metallib, but that's an assumption worth confirming before building on
+// it, not taking on faith.
+#[test]
+fn kernel_mul_mm_id_q4_k_pipeline_loads() {
+    let device = device();
+    let kernels = Kernels::new();
+    kernels
+        .load_pipeline(&device, Source::Quantized, "kernel_mul_mm_id_q4_K_f32")
+        .expect("kernel_mul_mm_id_q4_K_f32 should load as a Metal compute pipeline");
+}
+
+#[test]
+fn kernel_mul_mm_id_q6_k_pipeline_loads() {
+    let device = device();
+    let kernels = Kernels::new();
+    kernels
+        .load_pipeline(&device, Source::Quantized, "kernel_mul_mm_id_q6_K_f32")
+        .expect("kernel_mul_mm_id_q6_K_f32 should load as a Metal compute pipeline");
+}
