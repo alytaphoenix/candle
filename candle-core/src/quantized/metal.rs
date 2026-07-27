@@ -539,28 +539,63 @@ impl QMetalStorage {
             .map(|x| x * ids.dtype().size_in_bytes())
             .collect::<Vec<_>>();
 
-        candle_metal_kernels::call_quantized_matmul_mm_id(
-            device.device(),
-            &encoder,
-            device.kernels(),
-            self.dtype.into(),
-            self_shape.dims(),
-            &src0_stride,
-            &self.buffer,
-            self.offset,
-            in_shape.dims(),
-            &input_stride,
-            input.buffer(),
-            input_l.start_offset() * DType::F32.size_in_bytes(),
-            idx_shape.dims(),
-            &ids_stride,
-            ids.buffer(),
-            ids_l.start_offset() * ids.dtype().size_in_bytes(),
-            dst_shape.dims(),
-            0,
-            &dst,
-        )
-        .map_err(MetalError::from)?;
+        // Decode (batch == 1) routes to the matrix-*vector* kernel where
+        // the differential de-risk spike has validated it (Q4_K, Q6_K --
+        // this stack's production dtypes -- plus Q4_0/Q2_K for tuning-class
+        // coverage; see ratatoskr/DESIGN.md section 15 "Phase 2"). Every
+        // other dtype and every batch > 1 (prefill) call keeps using the
+        // matrix-*matrix* kernel -- always correct, just not the kernel
+        // Phase 2 targets for the decode throughput gap.
+        let use_mv = batch == 1
+            && matches!(self.dtype, GgmlDType::Q4K | GgmlDType::Q6K | GgmlDType::Q4_0 | GgmlDType::Q2K);
+
+        if use_mv {
+            candle_metal_kernels::call_quantized_matmul_mv_id(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                self.dtype.into(),
+                self_shape.dims(),
+                &src0_stride,
+                &self.buffer,
+                self.offset,
+                in_shape.dims(),
+                &input_stride,
+                input.buffer(),
+                input_l.start_offset() * DType::F32.size_in_bytes(),
+                idx_shape.dims(),
+                &ids_stride,
+                ids.buffer(),
+                ids_l.start_offset() * ids.dtype().size_in_bytes(),
+                dst_shape.dims(),
+                0,
+                &dst,
+            )
+            .map_err(MetalError::from)?;
+        } else {
+            candle_metal_kernels::call_quantized_matmul_mm_id(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                self.dtype.into(),
+                self_shape.dims(),
+                &src0_stride,
+                &self.buffer,
+                self.offset,
+                in_shape.dims(),
+                &input_stride,
+                input.buffer(),
+                input_l.start_offset() * DType::F32.size_in_bytes(),
+                idx_shape.dims(),
+                &ids_stride,
+                ids.buffer(),
+                ids_l.start_offset() * ids.dtype().size_in_bytes(),
+                dst_shape.dims(),
+                0,
+                &dst,
+            )
+            .map_err(MetalError::from)?;
+        }
 
         let dst_storage =
             crate::MetalStorage::new(dst, device.clone(), dst_shape.elem_count(), DType::F32);
