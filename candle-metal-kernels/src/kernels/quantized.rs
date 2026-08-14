@@ -882,13 +882,17 @@ fn mv_id_dispatch_params(dtype: GgmlDType) -> Result<(usize, usize, usize, &'sta
 /// threshold at the call site.
 ///
 /// Narrower than "every dtype `call_quantized_matmul_mv_id` can technically
-/// dispatch": Q4_1/Q5_0/Q5_1/Q8_0/Q3K/Q5K/F16/F32 all have real,
-/// ground-truth-derived tuning entries in `mv_id_dispatch_params` (ggml
-/// supports them, so the wrapper does too) but no differential test
-/// coverage against `call_quantized_matmul_mm_id` yet (see
-/// ratatoskr/DESIGN.md section 15's Phase 2 deferred items) -- they stay
-/// off this list until they get one, even though calling the wrapper
-/// directly with one of them would work correctly today.
+/// dispatch": Q4_1/Q8_0/F16/F32 all have real, ground-truth-derived tuning
+/// entries in `mv_id_dispatch_params` (ggml supports them, so the wrapper
+/// does too) but no differential test coverage against
+/// `call_quantized_matmul_mm_id` yet (see ratatoskr/DESIGN.md's "Decode
+/// throughput optimization" Phase 1) -- they stay off this list until they
+/// get one, even though calling the wrapper directly with one of them would
+/// work correctly today. Q5K/Q3K/Q5_0/Q5_1 joined the list in that phase:
+/// every currently-cached target model's real GGUF was found to route its
+/// MoE down- or up-projection through one of these four at decode, silently
+/// falling back to the slow `mm_id` path on every layer until they were
+/// added here.
 ///
 /// Also enforces ggml's own `ne00 >= nth0*nth1` minimum contraction-dim
 /// requirement (a real constraint of the mat-vec kernel, not an oversight):
@@ -905,6 +909,10 @@ pub fn mv_id_eligible(dtype: GgmlDType, k: usize) -> bool {
         GgmlDType::Q6K => 2 * 32,
         GgmlDType::Q4_0 => 8 * 8,
         GgmlDType::Q2K => 2 * 32,
+        GgmlDType::Q5K => 2 * 32,
+        GgmlDType::Q3K => 2 * 32,
+        GgmlDType::Q5_0 => 8 * 8,
+        GgmlDType::Q5_1 => 8 * 8,
         _ => return false,
     };
     k >= min_k

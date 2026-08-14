@@ -170,10 +170,10 @@ fn indexed_moe_forward_metal_decode_uses_mv_id(dtype: GgmlDType) -> Result<()> {
 
     let n_expert = 3usize;
     let n_out = 64usize;
-    // 256, not 64: K-quant dtypes (Q4K/Q6K/Q2K) require their last dim
-    // divisible by their own block size (256) -- a QTensor::quantize
+    // 256, not 64: K-quant dtypes (Q4K/Q6K/Q2K/Q5K/Q3K) require their last
+    // dim divisible by their own block size (256) -- a QTensor::quantize
     // constraint, unrelated to and stricter than mv_id's own nth0*nth1
-    // minimum (64 at most across the four covered dtypes), which 256
+    // minimum (64 at most across all eight covered dtypes), which 256
     // clears comfortably too.
     let n_in = 256usize;
     let batch = 1usize;
@@ -221,11 +221,15 @@ fn indexed_moe_forward_metal_decode_uses_mv_id(dtype: GgmlDType) -> Result<()> {
     Ok(())
 }
 
-// mv_id_eligible's exact four dtypes -- not a sample of them. Q4_K and
+// mv_id_eligible's exact eight dtypes -- not a sample of them. Q4_K and
 // Q6_K are the two ratatoskr/DESIGN.md section 15 calls mandatory (this
-// stack's real models); Q4_0/Q2_K round out tuning-class coverage. Each is
-// its own #[test] (rather than a loop inside one) so a failure names the
-// specific dtype instead of requiring a debugger to find it.
+// stack's real models); Q4_0/Q2_K round out tuning-class coverage. Q5_K,
+// Q3_K, Q5_0, Q5_1 joined in "Decode throughput optimization" (Phase 1) --
+// every currently-cached target model's MoE down- or up-projection uses one
+// of these four, so this is the correctness gate that unblocks each dtype's
+// entry in mv_id_eligible's allow-list. Each is its own #[test] (rather
+// than a loop inside one) so a failure names the specific dtype instead of
+// requiring a debugger to find it.
 #[cfg(feature = "metal")]
 #[test]
 fn indexed_moe_forward_metal_decode_uses_mv_id_q4k() -> Result<()> {
@@ -248,6 +252,30 @@ fn indexed_moe_forward_metal_decode_uses_mv_id_q4_0() -> Result<()> {
 #[test]
 fn indexed_moe_forward_metal_decode_uses_mv_id_q2k() -> Result<()> {
     indexed_moe_forward_metal_decode_uses_mv_id(GgmlDType::Q2K)
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn indexed_moe_forward_metal_decode_uses_mv_id_q5k() -> Result<()> {
+    indexed_moe_forward_metal_decode_uses_mv_id(GgmlDType::Q5K)
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn indexed_moe_forward_metal_decode_uses_mv_id_q3k() -> Result<()> {
+    indexed_moe_forward_metal_decode_uses_mv_id(GgmlDType::Q3K)
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn indexed_moe_forward_metal_decode_uses_mv_id_q5_0() -> Result<()> {
+    indexed_moe_forward_metal_decode_uses_mv_id(GgmlDType::Q5_0)
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn indexed_moe_forward_metal_decode_uses_mv_id_q5_1() -> Result<()> {
+    indexed_moe_forward_metal_decode_uses_mv_id(GgmlDType::Q5_1)
 }
 
 // Metal MoE Phase 3 (chunked mm_id, see ratatoskr/DESIGN.md section 15):

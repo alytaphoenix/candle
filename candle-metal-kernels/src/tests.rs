@@ -3129,13 +3129,13 @@ fn kernel_mul_mv_id_f32_matches_mm_id() {
     }
 }
 
-// Confirms the four mandatory-coverage quantized kernel names -- one per
-// distinct (nth0, nth1, width_divisor) tuning class reachable from
-// call_quantized_matmul_mv_id -- actually load as real Metal compute
-// pipelines from the compiled metallib. Q4_K and Q6_K are the dtypes this
-// stack's models actually use; Q4_0 and Q2_K cover the remaining classes
-// (see ratatoskr/DESIGN.md section 15's table) before either joins
-// production use. Mirrors kernel_mul_mm_id_q4_k_pipeline_loads's own
+// Confirms the eight mandatory-coverage quantized kernel names -- one per
+// dtype mv_id_eligible allow-lists -- actually load as real Metal compute
+// pipelines from the compiled metallib. Q4_K, Q6_K, Q5_K, Q3_K, Q5_0, Q5_1
+// are dtypes this stack's real cached models route through at decode
+// (ratatoskr/DESIGN.md's "Decode throughput optimization"); Q4_0 and Q2_K
+// round out the remaining tuning classes before either joins production
+// use. Mirrors kernel_mul_mm_id_q4_k_pipeline_loads's own
 // de-risk-spike-before-wiring precedent.
 #[test]
 fn kernel_mul_mv_id_pipelines_load() {
@@ -3146,6 +3146,10 @@ fn kernel_mul_mv_id_pipelines_load() {
         "kernel_mul_mv_id_q6_K_f32",
         "kernel_mul_mv_id_q4_0_f32",
         "kernel_mul_mv_id_q2_K_f32",
+        "kernel_mul_mv_id_q5_K_f32",
+        "kernel_mul_mv_id_q3_K_f32",
+        "kernel_mul_mv_id_q5_0_f32",
+        "kernel_mul_mv_id_q5_1_f32",
     ] {
         kernels
             .load_pipeline(&device, Source::Quantized, name)
