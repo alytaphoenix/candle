@@ -38,8 +38,8 @@ pub fn call_gdn_decode_step_f32(
     g: &Buffer,
     beta: &Buffer,
     state_in: &Buffer,
-    state_out: &mut Buffer,
-    out: &mut Buffer,
+    state_out: &Buffer,
+    out: &Buffer,
 ) -> Result<(), MetalKernelError> {
     #[derive(Debug)]
     #[repr(C)]

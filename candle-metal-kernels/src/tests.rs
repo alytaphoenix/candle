@@ -3650,10 +3650,10 @@ fn run_gdn_decode_step_and_check(b: usize, h: usize, hk: usize, hv: usize) {
     let g_buf = new_buffer(&device, &g_vals);
     let beta_buf = new_buffer(&device, &beta_vals);
     let state_in_buf = new_buffer(&device, &state_in);
-    let mut state_out_buf = device
+    let state_out_buf = device
         .new_buffer(b * h * hk * hv * std::mem::size_of::<f32>(), RESOURCE_OPTIONS)
         .unwrap();
-    let mut out_buf = device
+    let out_buf = device
         .new_buffer(b * h * hv * std::mem::size_of::<f32>(), RESOURCE_OPTIONS)
         .unwrap();
 
@@ -3671,8 +3671,8 @@ fn run_gdn_decode_step_and_check(b: usize, h: usize, hk: usize, hv: usize) {
         &g_buf,
         &beta_buf,
         &state_in_buf,
-        &mut state_out_buf,
-        &mut out_buf,
+        &state_out_buf,
+        &out_buf,
     )
     .unwrap();
     drop(encoder);
