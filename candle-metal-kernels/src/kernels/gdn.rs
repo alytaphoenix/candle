@@ -12,9 +12,13 @@ use objc2_metal::MTLSize;
 /// fresh buffer, `state_in` is read-only and untouched).
 ///
 /// Shapes (all contiguous F32): `q`/`k`: `[b, h, hk]`; `v`: `[b, h, hv]`;
-/// `g`/`beta`: `[b, h]` (`g` already `exp`'d -- the actual decay gate, same
-/// convention `sequential_step` itself expects, not `log_g`); `state_in`/
-/// `state_out`: `[b, h, hk, hv]`; `out`: `[b, h, hv]`.
+/// `g`/`beta`: `[b, h]` (`g` is **not** `exp`'d -- the kernel takes the raw
+/// decay-gate log directly and exponentiates it internally, Phase 4 of the
+/// fused-kernel design: this used to be a separate candle-side `.exp()?`
+/// dispatch on the caller's side, now folded in; `sequential_step`'s own
+/// convention still needs the pre-exp'd value for its own call, since it
+/// doesn't take this shortcut); `state_in`/`state_out`: `[b, h, hk, hv]`;
+/// `out`: `[b, h, hv]`.
 ///
 /// Every read input takes a `BufferOffset`, not a bare `Buffer` -- a real,
 /// found-live bug (ratatoskr's `qwen35_decode_step_matches_hf` differential,

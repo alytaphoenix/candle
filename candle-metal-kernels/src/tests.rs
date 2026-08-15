@@ -3587,17 +3587,20 @@ fn kernel_gdn_decode_step_pipeline_loads() {
 //   delta[j]    = (v[j] - kv_mem[j]) * beta
 //   s_out[i][j] = s_dec[i][j] + k[i] * delta[j]
 //   out[j]      = sum_i s_out[i][j] * q[i]
-// Per (batch, head) -- q/k: [hk], v: [hv], g/beta: scalar, state: [hk, hv].
+// Per (batch, head) -- q/k: [hk], v: [hv], g_log/beta: scalar, state: [hk, hv].
+// `g_log` is the raw decay-gate log, NOT pre-exponentiated -- matches the
+// kernel's own Phase-4 convention (it exponentiates internally now).
 fn gdn_decode_step_reference(
     q: &[f32],
     k: &[f32],
     v: &[f32],
-    g: f32,
+    g_log: f32,
     beta: f32,
     state_in: &[f32],
     hk: usize,
     hv: usize,
 ) -> (Vec<f32>, Vec<f32>) {
+    let g = g_log.exp();
     let mut state_out = vec![0f32; hk * hv];
     let mut out = vec![0f32; hv];
     for j in 0..hv {
@@ -3635,19 +3638,19 @@ fn run_gdn_decode_step_and_check(b: usize, h: usize, hk: usize, hv: usize) {
     let q = randf(&mut rng, b * h * hk, 0.2);
     let k = randf(&mut rng, b * h * hk, 0.2);
     let v = randf(&mut rng, b * h * hv, 2.0);
-    // g in (0,1) (post-exp decay gate, matching sequential_step's own
-    // convention -- the kernel takes g already exp'd, not log_g); beta in
-    // (0,1) too. Include the large_decay-style strong-decay regime
-    // (g close to 0) at least once via the caller's own shape choices --
-    // this helper takes whatever the caller passes.
-    let g_vals: Vec<f32> = (0..b * h).map(|_| rng.random::<f32>() * 0.9 + 0.05).collect();
+    // Sample the actual decay gate in (0,1) (a realistic range, matching
+    // the large_decay-style strong-decay regime at the low end), then take
+    // its log -- the kernel and the reference both take g_log directly
+    // now (Phase 4: exp() folded into the kernel), not the pre-exp'd gate.
+    let g_decay_vals: Vec<f32> = (0..b * h).map(|_| rng.random::<f32>() * 0.9 + 0.05).collect();
+    let g_log_vals: Vec<f32> = g_decay_vals.iter().map(|g| g.ln()).collect();
     let beta_vals: Vec<f32> = (0..b * h).map(|_| rng.random::<f32>() * 0.9 + 0.05).collect();
     let state_in = randf(&mut rng, b * h * hk * hv, 1.0);
 
     let q_buf = new_buffer(&device, &q);
     let k_buf = new_buffer(&device, &k);
     let v_buf = new_buffer(&device, &v);
-    let g_buf = new_buffer(&device, &g_vals);
+    let g_buf = new_buffer(&device, &g_log_vals);
     let beta_buf = new_buffer(&device, &beta_vals);
     let state_in_buf = new_buffer(&device, &state_in);
     let state_out_buf = device
@@ -3688,7 +3691,7 @@ fn run_gdn_decode_step_and_check(b: usize, h: usize, hk: usize, hv: usize) {
             &q[bh * hk..(bh + 1) * hk],
             &k[bh * hk..(bh + 1) * hk],
             &v[bh * hv..(bh + 1) * hv],
-            g_vals[bh],
+            g_log_vals[bh],
             beta_vals[bh],
             &state_in[bh * hk * hv..(bh + 1) * hk * hv],
             hk,
@@ -3767,13 +3770,18 @@ fn kernel_gdn_decode_step_respects_nonzero_buffer_offsets() {
     let q = randf(&mut rng, b * h * hk, 0.2);
     let k = randf(&mut rng, b * h * hk, 0.2);
     let v = randf(&mut rng, b * h * hv, 2.0);
-    let g_vals: Vec<f32> = (0..b * h).map(|_| rng.random::<f32>() * 0.9 + 0.05).collect();
+    // Values here don't need to be a realistic post-exp decay-gate range
+    // (unlike run_gdn_decode_step_and_check's own g values) -- this test
+    // is about offset correctness, not numeric range, and the kernel
+    // exponentiates internally regardless (Phase 4).
+    let g_log_vals: Vec<f32> = (0..b * h).map(|_| rng.random::<f32>() * 0.9 + 0.05).collect();
     let beta_vals: Vec<f32> = (0..b * h).map(|_| rng.random::<f32>() * 0.9 + 0.05).collect();
     let state_in = randf(&mut rng, b * h * hk * hv, 1.0);
     let decoy = randf(&mut rng, b * h * hk, 999.0); // same size as q, deliberately huge-magnitude so a wrong-offset read is obviously wrong
 
     let f32_size = std::mem::size_of::<f32>();
-    let packed: Vec<f32> = [&decoy[..], &q[..], &k[..], &v[..], &g_vals[..], &beta_vals[..], &state_in[..]].concat();
+    let packed: Vec<f32> =
+        [&decoy[..], &q[..], &k[..], &v[..], &g_log_vals[..], &beta_vals[..], &state_in[..]].concat();
     let packed_buf = new_buffer(&device, &packed);
 
     let mut offset_elems = decoy.len();
@@ -3784,7 +3792,7 @@ fn kernel_gdn_decode_step_respects_nonzero_buffer_offsets() {
     let v_off = BufferOffset { buffer: &packed_buf, offset_in_bytes: offset_elems * f32_size };
     offset_elems += v.len();
     let g_off = BufferOffset { buffer: &packed_buf, offset_in_bytes: offset_elems * f32_size };
-    offset_elems += g_vals.len();
+    offset_elems += g_log_vals.len();
     let beta_off = BufferOffset { buffer: &packed_buf, offset_in_bytes: offset_elems * f32_size };
     offset_elems += beta_vals.len();
     let state_in_off = BufferOffset { buffer: &packed_buf, offset_in_bytes: offset_elems * f32_size };
@@ -3812,7 +3820,7 @@ fn kernel_gdn_decode_step_respects_nonzero_buffer_offsets() {
             &q[bh * hk..(bh + 1) * hk],
             &k[bh * hk..(bh + 1) * hk],
             &v[bh * hv..(bh + 1) * hv],
-            g_vals[bh],
+            g_log_vals[bh],
             beta_vals[bh],
             &state_in[bh * hk * hv..(bh + 1) * hk * hv],
             hk,
