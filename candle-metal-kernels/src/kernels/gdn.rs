@@ -1,4 +1,4 @@
-use crate::utils::EncoderProvider;
+use crate::utils::{BufferOffset, EncoderProvider};
 use crate::{
     debug_group, set_params, Buffer, ComputeCommandEncoder, Device, EncoderParam, Kernels,
     MetalKernelError, Output, Source,
@@ -16,6 +16,19 @@ use objc2_metal::MTLSize;
 /// convention `sequential_step` itself expects, not `log_g`); `state_in`/
 /// `state_out`: `[b, h, hk, hv]`; `out`: `[b, h, hv]`.
 ///
+/// Every read input takes a `BufferOffset`, not a bare `Buffer` -- a real,
+/// found-live bug (ratatoskr's `qwen35_decode_step_matches_hf` differential,
+/// 2026-08-15) confirmed that at the real decode call site, `v` is a
+/// `narrow()`'d slice of a shared QKV-split buffer with a genuine nonzero
+/// byte offset (128 elements in the failing case), silently ignored by an
+/// earlier version of the ratatoskr-side wrapper that discarded each
+/// tensor's `Layout` and always bound offset 0 -- reading the wrong region
+/// of the buffer entirely. `q`/`k` happened to be offset-0 in that same
+/// failure (they pass through `l2_normalize`/scaling first, which
+/// materializes fresh contiguous tensors), which is exactly why this needs
+/// a real offset on *every* read input, not just the one that first
+/// exposed it.
+///
 /// Caller must bind `state_out` and `out` via the write path (this
 /// function already does, via `Output::new`) -- binding them read-only
 /// would leave the *next* decode step's read of `state_out` without a
@@ -32,12 +45,12 @@ pub fn call_gdn_decode_step_f32(
     h: usize,
     hk: usize,
     hv: usize,
-    q: &Buffer,
-    k: &Buffer,
-    v: &Buffer,
-    g: &Buffer,
-    beta: &Buffer,
-    state_in: &Buffer,
+    q: &BufferOffset,
+    k: &BufferOffset,
+    v: &BufferOffset,
+    g: &BufferOffset,
+    beta: &BufferOffset,
+    state_in: &BufferOffset,
     state_out: &Buffer,
     out: &Buffer,
 ) -> Result<(), MetalKernelError> {

@@ -3665,12 +3665,12 @@ fn run_gdn_decode_step_and_check(b: usize, h: usize, hk: usize, hv: usize) {
         h,
         hk,
         hv,
-        &q_buf,
-        &k_buf,
-        &v_buf,
-        &g_buf,
-        &beta_buf,
-        &state_in_buf,
+        &BufferOffset::zero_offset(&q_buf),
+        &BufferOffset::zero_offset(&k_buf),
+        &BufferOffset::zero_offset(&v_buf),
+        &BufferOffset::zero_offset(&g_buf),
+        &BufferOffset::zero_offset(&beta_buf),
+        &BufferOffset::zero_offset(&state_in_buf),
         &state_out_buf,
         &out_buf,
     )
@@ -3732,4 +3732,100 @@ fn kernel_gdn_decode_step_matches_scalar_reference_production_shape() {
     // against the cached qwen36-35b-a3b GGUF's qwen35moe.ssm.* metadata,
     // ratatoskr/DESIGN.md's fused-kernel Phase 0 section).
     run_gdn_decode_step_and_check(1, 32, 128, 128);
+}
+
+// Regression test for a real, found-live bug (ratatoskr's
+// qwen35_decode_step_matches_hf differential, 2026-08-15): the real decode
+// call site's `v` is a `narrow()`'d slice of a shared QKV-split buffer
+// with a genuine nonzero byte offset, which an earlier version of
+// call_gdn_decode_step_f32 (bare &Buffer params, no offset) silently
+// ignored -- reading the wrong region of the buffer. This test reproduces
+// that shape directly: q/k/v/g/beta/state_in are all slices into ONE
+// larger packed buffer at different offsets (not six independent
+// zero-offset allocations, which is what every other test here uses and
+// exactly why this bug slipped past them), so a wrong or ignored offset
+// reads cross-contaminated data and fails the numeric check hard, not
+// subtly.
+#[test]
+fn kernel_gdn_decode_step_respects_nonzero_buffer_offsets() {
+    let device = device();
+    let kernels = Kernels::new();
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
+
+    let (b, h, hk, hv) = (1usize, 4usize, 8usize, 8usize);
+    let mut rng = rng();
+    fn randf(rng: &mut impl Rng, n: usize, scale: f32) -> Vec<f32> {
+        (0..n).map(|_| (rng.random::<f32>() - 0.5) * scale).collect()
+    }
+
+    // Pack q, k, v, g, beta, state_in back-to-back into one buffer, each
+    // preceded by a "decoy" region of the *next* tensor's own values --
+    // i.e. deliberately construct it so that reading from byte offset 0
+    // instead of the real offset would read a DIFFERENT tensor's data,
+    // not just garbage. Layout: [decoy_q_sized][q][k][v][g][beta][state_in].
+    let q = randf(&mut rng, b * h * hk, 0.2);
+    let k = randf(&mut rng, b * h * hk, 0.2);
+    let v = randf(&mut rng, b * h * hv, 2.0);
+    let g_vals: Vec<f32> = (0..b * h).map(|_| rng.random::<f32>() * 0.9 + 0.05).collect();
+    let beta_vals: Vec<f32> = (0..b * h).map(|_| rng.random::<f32>() * 0.9 + 0.05).collect();
+    let state_in = randf(&mut rng, b * h * hk * hv, 1.0);
+    let decoy = randf(&mut rng, b * h * hk, 999.0); // same size as q, deliberately huge-magnitude so a wrong-offset read is obviously wrong
+
+    let f32_size = std::mem::size_of::<f32>();
+    let packed: Vec<f32> = [&decoy[..], &q[..], &k[..], &v[..], &g_vals[..], &beta_vals[..], &state_in[..]].concat();
+    let packed_buf = new_buffer(&device, &packed);
+
+    let mut offset_elems = decoy.len();
+    let q_off = BufferOffset { buffer: &packed_buf, offset_in_bytes: offset_elems * f32_size };
+    offset_elems += q.len();
+    let k_off = BufferOffset { buffer: &packed_buf, offset_in_bytes: offset_elems * f32_size };
+    offset_elems += k.len();
+    let v_off = BufferOffset { buffer: &packed_buf, offset_in_bytes: offset_elems * f32_size };
+    offset_elems += v.len();
+    let g_off = BufferOffset { buffer: &packed_buf, offset_in_bytes: offset_elems * f32_size };
+    offset_elems += g_vals.len();
+    let beta_off = BufferOffset { buffer: &packed_buf, offset_in_bytes: offset_elems * f32_size };
+    offset_elems += beta_vals.len();
+    let state_in_off = BufferOffset { buffer: &packed_buf, offset_in_bytes: offset_elems * f32_size };
+
+    let state_out_buf = device
+        .new_buffer(b * h * hk * hv * f32_size, RESOURCE_OPTIONS)
+        .unwrap();
+    let out_buf = device.new_buffer(b * h * hv * f32_size, RESOURCE_OPTIONS).unwrap();
+
+    call_gdn_decode_step_f32(
+        &device, &encoder, &kernels, b, h, hk, hv, &q_off, &k_off, &v_off, &g_off, &beta_off,
+        &state_in_off, &state_out_buf, &out_buf,
+    )
+    .unwrap();
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
+
+    let got_out: Vec<f32> = read_to_vec(&out_buf, b * h * hv);
+    let got_state: Vec<f32> = read_to_vec(&state_out_buf, b * h * hk * hv);
+
+    let mut max_out_diff = 0f32;
+    let mut max_state_diff = 0f32;
+    for bh in 0..b * h {
+        let (expected_out, expected_state) = gdn_decode_step_reference(
+            &q[bh * hk..(bh + 1) * hk],
+            &k[bh * hk..(bh + 1) * hk],
+            &v[bh * hv..(bh + 1) * hv],
+            g_vals[bh],
+            beta_vals[bh],
+            &state_in[bh * hk * hv..(bh + 1) * hk * hv],
+            hk,
+            hv,
+        );
+        for j in 0..hv {
+            max_out_diff = max_out_diff.max((got_out[bh * hv + j] - expected_out[j]).abs());
+        }
+        for e in 0..hk * hv {
+            max_state_diff = max_state_diff.max((got_state[bh * hk * hv + e] - expected_state[e]).abs());
+        }
+    }
+    println!("gdn_decode_step_nonzero_offsets: out_diff={max_out_diff:.8} state_diff={max_state_diff:.8}");
+    assert!(max_out_diff < 5e-5, "nonzero-offset output mismatch, max diff = {max_out_diff}");
+    assert!(max_state_diff < 5e-5, "nonzero-offset state mismatch, max diff = {max_state_diff}");
 }
