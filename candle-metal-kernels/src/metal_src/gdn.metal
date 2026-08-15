@@ -76,3 +76,99 @@ kernel void kernel_gdn_decode_step_f32(
     }
     out[bh * hv + j] = acc;
 }
+
+// Fused causal depthwise conv1d + silu for gated-DeltaNet's preprocessing
+// pipeline -- replaces ratatoskr's `SSMWeights::apply_conv1d`'s Rust-level
+// `for t in 0..seq_len { for k in 0..kernel { ... } }` loop (O(seq_len *
+// kernel_size) separate candle tensor-op dispatches -- narrow/broadcast_mul/
+// add per tap) with one dispatch for the conv+silu output and one small
+// dispatch for the next conv state. See yggdrasil/ratatoskr/DESIGN.md's
+// native-MTP section, "DeltaNet-preprocessing fusion" subsection, for the
+// full design and the dispatch-count arithmetic this must beat.
+//
+// Conceptually operates on `padded = history ++ x` (concat along time),
+// length `hist_len + seq_len`. For output position t (0 <= t < seq_len):
+//   out[t][c] = silu( sum_k padded[t+k][c] * weight[c][k] )
+// For next-state position s (0 <= s < hist_len) -- the trailing hist_len
+// entries of `padded`, i.e. `padded[seq_len + s]`:
+//   new_state[s][c] = padded[seq_len + s][c]
+// Both are expressed directly against `history`/`x` (never materializing
+// `padded` itself) via the same `idx < hist_len ? history[idx] : x[idx -
+// hist_len]` branch -- one thread per (channel, output-position, batch), no
+// cross-thread communication, no threadgroup memory. `new_state` is written
+// functionally (a fresh buffer) -- same correctness discipline as
+// `kernel_gdn_decode_step_f32` above: a prior session-checkpoint clone of
+// the old conv_state must survive this call completely unchanged.
+//
+// weight is `[channels, kernel_size]`, already canonicalized to that exact
+// layout by the caller (ratatoskr's own `ssm_conv1d` GGUF tensor can arrive
+// as either `[channels, kernel]` or `[kernel, channels]` -- the transpose,
+// if needed, happens once at model-load time, not per dispatch, and never
+// inside this kernel).
+
+struct gdn_conv1d_args {
+    uint seq_len;
+    uint hist_len;
+    uint channels;
+    uint kernel_size; // only read by the _output kernel; harmless unused field on the _state kernel
+};
+
+kernel void kernel_gdn_causal_conv1d_output_f32(
+        device const float * x        [[buffer(0)]],  // [b, seq_len, channels]
+        device const float * history  [[buffer(1)]],  // [b, hist_len, channels]
+        device const float * weight   [[buffer(2)]],  // [channels, kernel_size]
+        device float       * out      [[buffer(3)]],  // [b, seq_len, channels], silu already applied
+        constant gdn_conv1d_args & args [[buffer(4)]],
+        uint3 gid [[thread_position_in_grid]]) {
+    const uint c = gid.x;
+    const uint t = gid.y;
+    if (c >= args.channels || t >= args.seq_len) {
+        return;
+    }
+    const uint hist_len = args.hist_len;
+    const uint seq_len = args.seq_len;
+    const uint channels = args.channels;
+    const uint kernel_size = args.kernel_size;
+    const uint b = gid.z;
+
+    device const float * xb = x + b * seq_len * channels;
+    device const float * hb = history + b * hist_len * channels;
+    device const float * wc = weight + c * kernel_size;
+
+    float acc = 0.0f;
+    for (uint k = 0; k < kernel_size; ++k) {
+        const uint idx = t + k; // index into conceptual padded = history ++ x
+        const float val = (idx < hist_len)
+            ? hb[idx * channels + c]
+            : xb[(idx - hist_len) * channels + c];
+        acc += val * wc[k];
+    }
+    // silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
+    out[(b * seq_len + t) * channels + c] = acc / (1.0f + exp(-acc));
+}
+
+kernel void kernel_gdn_causal_conv1d_state_f32(
+        device const float * x           [[buffer(0)]],  // [b, seq_len, channels]
+        device const float * history     [[buffer(1)]],  // [b, hist_len, channels]
+        device float       * new_state   [[buffer(2)]],  // [b, hist_len, channels], functional
+        constant gdn_conv1d_args & args [[buffer(3)]],
+        uint3 gid [[thread_position_in_grid]]) {
+    const uint c = gid.x;
+    const uint s = gid.y;
+    if (c >= args.channels || s >= args.hist_len) {
+        return;
+    }
+    const uint hist_len = args.hist_len;
+    const uint seq_len = args.seq_len;
+    const uint channels = args.channels;
+    const uint b = gid.z;
+
+    device const float * xb = x + b * seq_len * channels;
+    device const float * hb = history + b * hist_len * channels;
+
+    const uint idx = seq_len + s; // index into conceptual padded = history ++ x
+    const float val = (idx < hist_len)
+        ? hb[idx * channels + c]
+        : xb[(idx - hist_len) * channels + c];
+    new_state[(b * hist_len + s) * channels + c] = val;
+}

@@ -8,7 +8,8 @@ pub mod utils;
 pub use err::MetalKernelError;
 pub use kernel::Kernels;
 pub use kernels::{
-    affine::*, call_binary_contiguous, call_binary_strided, call_gdn_decode_step_f32,
+    affine::*, call_binary_contiguous, call_binary_strided, call_gdn_causal_conv1d_output_f32,
+    call_gdn_causal_conv1d_state_f32, call_gdn_decode_step_f32,
     call_mlx_gemm, cast::*, convolution::*, fill::*, indexing::*, quantized::*, random::*,
     reduce::*, sdpa::*, sort::*, ternary::*, unary, unary::*, GemmDType, GgmlDType,
 };
