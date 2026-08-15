@@ -243,3 +243,135 @@ pub fn call_gdn_causal_conv1d_state_f32(
     encoder.dispatch_threads(grid_dims, group_dims);
     Ok(())
 }
+
+#[repr(C)]
+struct GdnL2NormArgs {
+    seq_len: u32,
+    heads: u32,
+    dim: u32,
+    scale: f32,
+    eps: f32,
+}
+
+impl EncoderParam for GdnL2NormArgs {
+    fn set_param(encoder: &ComputeCommandEncoder, position: usize, data: Self) {
+        encoder.set_bytes(position, &data);
+    }
+}
+
+/// Fused L2-normalize + scale -- DeltaNet-preprocessing fusion Kernel B,
+/// the q/k half. See `metal_src/gdn.metal`'s own doc comment for the exact
+/// math (eps is added to the sum of squares, matching
+/// ratatoskr's `SSMWeights::l2_normalize` exactly -- do not substitute a
+/// generic RMS-norm kernel, the epsilon placement differs). Called once for
+/// q (`scale = 1/sqrt(state_size)`) and once for k (`scale = 1.0`).
+///
+/// Shapes (contiguous F32): `x`/`out`: `[b, seq_len, heads, dim]`.
+#[allow(clippy::too_many_arguments)]
+pub fn call_gdn_l2_normalize_scale_f32(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    b: usize,
+    seq_len: usize,
+    heads: usize,
+    dim: usize,
+    scale: f32,
+    eps: f32,
+    x: &BufferOffset,
+    out: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Gdn, "kernel_gdn_l2_normalize_scale_f32")?;
+
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "gdn_l2_normalize_scale b={b} seq_len={seq_len} heads={heads} dim={dim} scale={scale}");
+
+    let args = GdnL2NormArgs {
+        seq_len: seq_len as u32,
+        heads: heads as u32,
+        dim: dim as u32,
+        scale,
+        eps,
+    };
+    set_params!(encoder, (x, Output::new(out), args));
+
+    let grid_dims = MTLSize {
+        width: heads,
+        height: seq_len,
+        depth: b,
+    };
+    let group_dims = MTLSize {
+        width: heads.min(64),
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_threads(grid_dims, group_dims);
+    Ok(())
+}
+
+#[repr(C)]
+struct GdnDecayBetaArgs {
+    seq_len: u32,
+    heads: u32,
+}
+
+impl EncoderParam for GdnDecayBetaArgs {
+    fn set_param(encoder: &ComputeCommandEncoder, position: usize, data: Self) {
+        encoder.set_bytes(position, &data);
+    }
+}
+
+/// Fused decay-gate softplus + beta sigmoid -- DeltaNet-preprocessing
+/// fusion Kernel B, the gating half. See `metal_src/gdn.metal`'s own doc
+/// comment for the exact math. `dt_bias`/`ssm_a` are indexed directly by
+/// head (`[heads]`), not pre-broadcast -- this eliminates the caller's own
+/// `broadcast_as` calls entirely, not just the elementwise math around them.
+///
+/// Shapes (contiguous F32): `alpha_logits`/`beta_logits`/`g_out`/`beta_out`:
+/// `[b, seq_len, heads]`; `dt_bias`/`ssm_a`: `[heads]`.
+#[allow(clippy::too_many_arguments)]
+pub fn call_gdn_decay_beta_gate_f32(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    b: usize,
+    seq_len: usize,
+    heads: usize,
+    alpha_logits: &BufferOffset,
+    dt_bias: &BufferOffset,
+    ssm_a: &BufferOffset,
+    beta_logits: &BufferOffset,
+    g_out: &Buffer,
+    beta_out: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Gdn, "kernel_gdn_decay_beta_gate_f32")?;
+
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "gdn_decay_beta_gate b={b} seq_len={seq_len} heads={heads}");
+
+    let args = GdnDecayBetaArgs {
+        seq_len: seq_len as u32,
+        heads: heads as u32,
+    };
+    set_params!(
+        encoder,
+        (alpha_logits, dt_bias, ssm_a, beta_logits, Output::new(g_out), Output::new(beta_out), args)
+    );
+
+    let grid_dims = MTLSize {
+        width: heads,
+        height: seq_len,
+        depth: b,
+    };
+    let group_dims = MTLSize {
+        width: heads.min(64),
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_threads(grid_dims, group_dims);
+    Ok(())
+}

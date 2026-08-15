@@ -172,3 +172,90 @@ kernel void kernel_gdn_causal_conv1d_state_f32(
         : xb[(idx - hist_len) * channels + c];
     new_state[(b * hist_len + s) * channels + c] = val;
 }
+
+// DeltaNet-preprocessing fusion, Kernel B (gated-DeltaNet MTP-verify-step
+// investigation, see yggdrasil/ratatoskr/DESIGN.md's native-MTP section,
+// "DeltaNet-preprocessing fusion" subsection): the elementwise gating tail,
+// two independent sub-kernels replacing ~17 separate candle dispatches
+// (L2-normalize q and k, scale q, softplus-decay g, sigmoid beta) with two.
+//
+// kernel_gdn_l2_normalize_scale_f32: out[b][t][h][:] = scale *
+// x[b][t][h][:] / sqrt(sum_d x[b][t][h][d]^2 + eps), matching
+// SSMWeights::l2_normalize's own eps placement (added to the sum of
+// squares, not the mean) exactly -- do not substitute a generic RMS-norm
+// kernel here, the epsilon semantics differ. One thread per (b, t, h),
+// looping over `dim` twice (sum-of-squares, then the normalized write) --
+// re-reads `x` rather than caching it in a local array, matching this
+// file's existing preference for simple per-thread loops over
+// threadgroup-memory tricks (dim is small, ~64-256, so the extra read is
+// cheap). Called once for q (scale = 1/sqrt(state_size)) and once for k
+// (scale = 1.0) -- two dispatches of the same kernel, not two kernels.
+struct gdn_l2norm_args {
+    uint seq_len;
+    uint heads;
+    uint dim;
+    float scale;
+    float eps;
+};
+
+kernel void kernel_gdn_l2_normalize_scale_f32(
+        device const float * x    [[buffer(0)]],  // [b, seq_len, heads, dim]
+        device float       * out  [[buffer(1)]],  // [b, seq_len, heads, dim]
+        constant gdn_l2norm_args & args [[buffer(2)]],
+        uint3 gid [[thread_position_in_grid]]) {
+    const uint h = gid.x;
+    const uint t = gid.y;
+    if (h >= args.heads || t >= args.seq_len) {
+        return;
+    }
+    const uint dim = args.dim;
+    const uint b = gid.z;
+    const uint row = (b * args.seq_len + t) * args.heads + h;
+    device const float * xr = x + row * dim;
+    device float       * outr = out + row * dim;
+
+    float sum_sq = 0.0f;
+    for (uint d = 0; d < dim; ++d) {
+        const float v = xr[d];
+        sum_sq += v * v;
+    }
+    const float inv_norm = args.scale / sqrt(sum_sq + args.eps);
+    for (uint d = 0; d < dim; ++d) {
+        outr[d] = xr[d] * inv_norm;
+    }
+}
+
+// kernel_gdn_decay_beta_gate_f32: fuses the decay-gate softplus chain and
+// the beta sigmoid, matching SSMWeights::forward's own math exactly:
+//   g[b][t][h]    = ssm_a[h] * log(exp(alpha_logits[b][t][h] + dt_bias[h]) + 1)
+//   beta[b][t][h] = sigmoid(beta_logits[b][t][h])
+// `dt_bias`/`ssm_a` are indexed directly by head (`[heads]`, not
+// pre-broadcast to `[b, seq_len, heads]` -- eliminates the
+// candle-side `broadcast_as` calls entirely, not just the elementwise math
+// around them). One thread per (b, t, h), no reduction, purely elementwise.
+struct gdn_decay_beta_args {
+    uint seq_len;
+    uint heads;
+};
+
+kernel void kernel_gdn_decay_beta_gate_f32(
+        device const float * alpha_logits [[buffer(0)]],  // [b, seq_len, heads]
+        device const float * dt_bias      [[buffer(1)]],  // [heads]
+        device const float * ssm_a        [[buffer(2)]],  // [heads]
+        device const float * beta_logits  [[buffer(3)]],  // [b, seq_len, heads]
+        device float       * g_out        [[buffer(4)]],  // [b, seq_len, heads]
+        device float       * beta_out     [[buffer(5)]],  // [b, seq_len, heads]
+        constant gdn_decay_beta_args & args [[buffer(6)]],
+        uint3 gid [[thread_position_in_grid]]) {
+    const uint h = gid.x;
+    const uint t = gid.y;
+    if (h >= args.heads || t >= args.seq_len) {
+        return;
+    }
+    const uint b = gid.z;
+    const uint idx = (b * args.seq_len + t) * args.heads + h;
+
+    const float softplus = log(exp(alpha_logits[idx] + dt_bias[h]) + 1.0f);
+    g_out[idx] = ssm_a[h] * softplus;
+    beta_out[idx] = 1.0f / (1.0f + exp(-beta_logits[idx]));
+}

@@ -4543,3 +4543,208 @@ fn kernel_gdn_causal_conv1d_respects_nonzero_buffer_offsets() {
     assert!(max_out_diff < 5e-5, "nonzero-offset output mismatch, max diff = {max_out_diff}");
     assert!(max_state_diff < 5e-5, "nonzero-offset state mismatch, max diff = {max_state_diff}");
 }
+
+// DeltaNet-preprocessing fusion, Kernel B (see yggdrasil/ratatoskr/
+// DESIGN.md's native-MTP section): the elementwise gating tail. Same
+// de-risk-spike-before-wiring precedent as Kernel A above.
+#[test]
+fn kernel_gdn_preprocessing_gating_pipelines_load() {
+    let device = device();
+    let kernels = Kernels::new();
+    for name in ["kernel_gdn_l2_normalize_scale_f32", "kernel_gdn_decay_beta_gate_f32"] {
+        kernels
+            .load_pipeline(&device, Source::Gdn, name)
+            .unwrap_or_else(|e| panic!("{name} should load as a Metal compute pipeline: {e}"));
+    }
+}
+
+/// Scalar Rust reference for `kernel_gdn_l2_normalize_scale_f32`, matching
+/// `SSMWeights::l2_normalize` exactly (eps added to the sum of squares).
+fn gdn_l2_normalize_scale_reference(x: &[f32], b: usize, seq_len: usize, heads: usize, dim: usize, scale: f32, eps: f32) -> Vec<f32> {
+    let mut out = vec![0f32; b * seq_len * heads * dim];
+    for row in 0..b * seq_len * heads {
+        let xr = &x[row * dim..(row + 1) * dim];
+        let sum_sq: f32 = xr.iter().map(|v| v * v).sum();
+        let inv_norm = scale / (sum_sq + eps).sqrt();
+        for d in 0..dim {
+            out[row * dim + d] = xr[d] * inv_norm;
+        }
+    }
+    out
+}
+
+#[test]
+fn kernel_gdn_l2_normalize_scale_matches_scalar_reference() {
+    let device = device();
+    let kernels = Kernels::new();
+    let mut rng = rng();
+    fn randf(rng: &mut impl Rng, n: usize, scale: f32) -> Vec<f32> {
+        (0..n).map(|_| (rng.random::<f32>() - 0.5) * scale).collect()
+    }
+
+    // (b, seq_len, heads, dim, scale) -- heads=5 (not a multiple of the
+    // threadgroup width min(heads,64)) at one shape to exercise the bounds
+    // check; dim=128 matches the real production state_size.
+    for (b, seq_len, heads, dim, scale) in [
+        (1usize, 1usize, 32usize, 128usize, 1f32 / (128f32).sqrt()),
+        (2usize, 8usize, 5usize, 128usize, 1.0f32),
+        (1usize, 2usize, 32usize, 128usize, 1.0f32),
+    ] {
+        let eps = 1e-6f32;
+        let x = randf(&mut rng, b * seq_len * heads * dim, 1.0);
+        let x_buf = new_buffer(&device, &x);
+        let out_buf = device
+            .new_buffer(b * seq_len * heads * dim * std::mem::size_of::<f32>(), RESOURCE_OPTIONS)
+            .unwrap();
+
+        let commands = commands(&device);
+        let encoder = commands.command_encoder().unwrap();
+        call_gdn_l2_normalize_scale_f32(
+            &device, &encoder, &kernels, b, seq_len, heads, dim, scale, eps,
+            &BufferOffset::zero_offset(&x_buf), &out_buf,
+        )
+        .unwrap();
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+
+        let got: Vec<f32> = read_to_vec(&out_buf, b * seq_len * heads * dim);
+        let expected = gdn_l2_normalize_scale_reference(&x, b, seq_len, heads, dim, scale, eps);
+        let max_diff = got.iter().zip(expected.iter()).fold(0f32, |m, (a, e)| m.max((a - e).abs()));
+        println!("gdn_l2_normalize_scale b={b} seq_len={seq_len} heads={heads} dim={dim} scale={scale}: diff={max_diff:.8}");
+        assert!(max_diff < 5e-5, "b={b} seq_len={seq_len} heads={heads}: mismatch, max diff = {max_diff}");
+    }
+}
+
+/// Scalar Rust reference for `kernel_gdn_decay_beta_gate_f32`, matching
+/// `SSMWeights::forward`'s own `g`/`beta` computation exactly.
+fn gdn_decay_beta_gate_reference(
+    alpha_logits: &[f32],
+    dt_bias: &[f32],
+    ssm_a: &[f32],
+    beta_logits: &[f32],
+    b: usize,
+    seq_len: usize,
+    heads: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut g = vec![0f32; b * seq_len * heads];
+    let mut beta = vec![0f32; b * seq_len * heads];
+    for row in 0..b * seq_len {
+        for h in 0..heads {
+            let idx = row * heads + h;
+            // Naive log(exp(x)+1), deliberately not the more numerically
+            // stable ln_1p(exp(x)) -- matches this kernel's own (and the
+            // original candle code's own) naive formula exactly, so this
+            // reference isn't "more correct" in a way that could show a
+            // spurious diff from different rounding at the same inputs.
+            let softplus = ((alpha_logits[idx] + dt_bias[h]).exp() + 1.0).ln();
+            g[idx] = ssm_a[h] * softplus;
+            beta[idx] = 1.0 / (1.0 + (-beta_logits[idx]).exp());
+        }
+    }
+    (g, beta)
+}
+
+#[test]
+fn kernel_gdn_decay_beta_gate_matches_scalar_reference() {
+    let device = device();
+    let kernels = Kernels::new();
+    let mut rng = rng();
+    fn randf(rng: &mut impl Rng, n: usize, scale: f32) -> Vec<f32> {
+        (0..n).map(|_| (rng.random::<f32>() - 0.5) * scale).collect()
+    }
+
+    for (b, seq_len, heads) in [(1usize, 1usize, 32usize), (2usize, 8usize, 5usize), (1usize, 2usize, 32usize)] {
+        let alpha_logits = randf(&mut rng, b * seq_len * heads, 2.0);
+        let dt_bias = randf(&mut rng, heads, 1.0);
+        let ssm_a = randf(&mut rng, heads, 1.0);
+        let beta_logits = randf(&mut rng, b * seq_len * heads, 2.0);
+
+        let alpha_buf = new_buffer(&device, &alpha_logits);
+        let dt_bias_buf = new_buffer(&device, &dt_bias);
+        let ssm_a_buf = new_buffer(&device, &ssm_a);
+        let beta_logits_buf = new_buffer(&device, &beta_logits);
+        let g_out_buf = device.new_buffer(b * seq_len * heads * std::mem::size_of::<f32>(), RESOURCE_OPTIONS).unwrap();
+        let beta_out_buf = device.new_buffer(b * seq_len * heads * std::mem::size_of::<f32>(), RESOURCE_OPTIONS).unwrap();
+
+        let commands = commands(&device);
+        let encoder = commands.command_encoder().unwrap();
+        call_gdn_decay_beta_gate_f32(
+            &device, &encoder, &kernels, b, seq_len, heads,
+            &BufferOffset::zero_offset(&alpha_buf), &BufferOffset::zero_offset(&dt_bias_buf),
+            &BufferOffset::zero_offset(&ssm_a_buf), &BufferOffset::zero_offset(&beta_logits_buf),
+            &g_out_buf, &beta_out_buf,
+        )
+        .unwrap();
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+
+        let got_g: Vec<f32> = read_to_vec(&g_out_buf, b * seq_len * heads);
+        let got_beta: Vec<f32> = read_to_vec(&beta_out_buf, b * seq_len * heads);
+        let (expected_g, expected_beta) =
+            gdn_decay_beta_gate_reference(&alpha_logits, &dt_bias, &ssm_a, &beta_logits, b, seq_len, heads);
+
+        let g_diff = got_g.iter().zip(expected_g.iter()).fold(0f32, |m, (a, e)| m.max((a - e).abs()));
+        let beta_diff = got_beta.iter().zip(expected_beta.iter()).fold(0f32, |m, (a, e)| m.max((a - e).abs()));
+        println!("gdn_decay_beta_gate b={b} seq_len={seq_len} heads={heads}: g_diff={g_diff:.8} beta_diff={beta_diff:.8}");
+        assert!(g_diff < 5e-5, "b={b} seq_len={seq_len} heads={heads}: g mismatch, max diff = {g_diff}");
+        assert!(beta_diff < 5e-5, "b={b} seq_len={seq_len} heads={heads}: beta mismatch, max diff = {beta_diff}");
+    }
+}
+
+// Regression-shaped test for the same offset bug class the earlier fused
+// kernels found live: packs alpha_logits/dt_bias/ssm_a/beta_logits into
+// ONE buffer with a decoy region ahead of each, at real nonzero offsets.
+#[test]
+fn kernel_gdn_decay_beta_gate_respects_nonzero_buffer_offsets() {
+    let device = device();
+    let kernels = Kernels::new();
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
+
+    let (b, seq_len, heads) = (1usize, 2usize, 8usize);
+    let mut rng = rng();
+    fn randf(rng: &mut impl Rng, n: usize, scale: f32) -> Vec<f32> {
+        (0..n).map(|_| (rng.random::<f32>() - 0.5) * scale).collect()
+    }
+
+    let alpha_logits = randf(&mut rng, b * seq_len * heads, 2.0);
+    let dt_bias = randf(&mut rng, heads, 1.0);
+    let ssm_a = randf(&mut rng, heads, 1.0);
+    let beta_logits = randf(&mut rng, b * seq_len * heads, 2.0);
+    let decoy = randf(&mut rng, b * seq_len * heads, 999.0);
+
+    let f32_size = std::mem::size_of::<f32>();
+    let packed: Vec<f32> = [&decoy[..], &alpha_logits[..], &dt_bias[..], &ssm_a[..], &beta_logits[..]].concat();
+    let packed_buf = new_buffer(&device, &packed);
+
+    let mut offset_elems = decoy.len();
+    let alpha_off = BufferOffset { buffer: &packed_buf, offset_in_bytes: offset_elems * f32_size };
+    offset_elems += alpha_logits.len();
+    let dt_bias_off = BufferOffset { buffer: &packed_buf, offset_in_bytes: offset_elems * f32_size };
+    offset_elems += dt_bias.len();
+    let ssm_a_off = BufferOffset { buffer: &packed_buf, offset_in_bytes: offset_elems * f32_size };
+    offset_elems += ssm_a.len();
+    let beta_off = BufferOffset { buffer: &packed_buf, offset_in_bytes: offset_elems * f32_size };
+
+    let g_out_buf = device.new_buffer(b * seq_len * heads * f32_size, RESOURCE_OPTIONS).unwrap();
+    let beta_out_buf = device.new_buffer(b * seq_len * heads * f32_size, RESOURCE_OPTIONS).unwrap();
+
+    call_gdn_decay_beta_gate_f32(
+        &device, &encoder, &kernels, b, seq_len, heads,
+        &alpha_off, &dt_bias_off, &ssm_a_off, &beta_off, &g_out_buf, &beta_out_buf,
+    )
+    .unwrap();
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
+
+    let got_g: Vec<f32> = read_to_vec(&g_out_buf, b * seq_len * heads);
+    let got_beta: Vec<f32> = read_to_vec(&beta_out_buf, b * seq_len * heads);
+    let (expected_g, expected_beta) =
+        gdn_decay_beta_gate_reference(&alpha_logits, &dt_bias, &ssm_a, &beta_logits, b, seq_len, heads);
+
+    let g_diff = got_g.iter().zip(expected_g.iter()).fold(0f32, |m, (a, e)| m.max((a - e).abs()));
+    let beta_diff = got_beta.iter().zip(expected_beta.iter()).fold(0f32, |m, (a, e)| m.max((a - e).abs()));
+    println!("gdn_decay_beta_gate_nonzero_offsets: g_diff={g_diff:.8} beta_diff={beta_diff:.8}");
+    assert!(g_diff < 5e-5, "nonzero-offset g mismatch, max diff = {g_diff}");
+    assert!(beta_diff < 5e-5, "nonzero-offset beta mismatch, max diff = {beta_diff}");
+}
