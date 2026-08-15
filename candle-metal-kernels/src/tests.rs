@@ -3564,3 +3564,172 @@ fn kernel_mul_mm_id_chunked_succeeds_above_the_real_device_ceiling() {
         }
     }
 }
+
+// Fused gated-DeltaNet decode step (yggdrasil ratatoskr's fused-kernel
+// design, DESIGN.md's "Fused Metal kernel for `sequential_step`" section):
+// confirms the kernel compiles and loads as a real Metal pipeline before
+// any numeric-correctness work is asked to rely on it -- same
+// de-risk-spike-before-wiring precedent as kernel_mul_mv_id_pipelines_load.
+#[test]
+fn kernel_gdn_decode_step_pipeline_loads() {
+    let device = device();
+    let kernels = Kernels::new();
+    kernels
+        .load_pipeline(&device, Source::Gdn, "kernel_gdn_decode_step_f32")
+        .unwrap_or_else(|e| panic!("kernel_gdn_decode_step_f32 should load as a Metal compute pipeline: {e}"));
+}
+
+// Scalar Rust reference for the fused kernel's math, matching
+// ratatoskr::qwen3_5_linear_attn_scan::sequential_step's own five real
+// ops line-by-line (see gdn.metal's own doc comment for the derivation):
+//   s_dec[i][j] = g * s_in[i][j]
+//   kv_mem[j]   = sum_i s_dec[i][j] * k[i]
+//   delta[j]    = (v[j] - kv_mem[j]) * beta
+//   s_out[i][j] = s_dec[i][j] + k[i] * delta[j]
+//   out[j]      = sum_i s_out[i][j] * q[i]
+// Per (batch, head) -- q/k: [hk], v: [hv], g/beta: scalar, state: [hk, hv].
+fn gdn_decode_step_reference(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    g: f32,
+    beta: f32,
+    state_in: &[f32],
+    hk: usize,
+    hv: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut state_out = vec![0f32; hk * hv];
+    let mut out = vec![0f32; hv];
+    for j in 0..hv {
+        let mut kv_mem = 0f32;
+        for i in 0..hk {
+            kv_mem += (g * state_in[i * hv + j]) * k[i];
+        }
+        let delta = (v[j] - kv_mem) * beta;
+        let mut acc = 0f32;
+        for i in 0..hk {
+            let s_new = g * state_in[i * hv + j] + k[i] * delta;
+            state_out[i * hv + j] = s_new;
+            acc += s_new * q[i];
+        }
+        out[j] = acc;
+    }
+    (out, state_out)
+}
+
+// Runs the real kernel on random inputs at the given shape and compares
+// against the scalar reference above, per (batch, head). `hv` deliberately
+// not always a multiple of the threadgroup width (min(hv, 64) in
+// call_gdn_decode_step_f32) to exercise the kernel's own `j >= args.hv`
+// bounds check, not just the common case.
+fn run_gdn_decode_step_and_check(b: usize, h: usize, hk: usize, hv: usize) {
+    let device = device();
+    let kernels = Kernels::new();
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
+
+    let mut rng = rng();
+    fn randf(rng: &mut impl Rng, n: usize, scale: f32) -> Vec<f32> {
+        (0..n).map(|_| (rng.random::<f32>() - 0.5) * scale).collect()
+    }
+    let q = randf(&mut rng, b * h * hk, 0.2);
+    let k = randf(&mut rng, b * h * hk, 0.2);
+    let v = randf(&mut rng, b * h * hv, 2.0);
+    // g in (0,1) (post-exp decay gate, matching sequential_step's own
+    // convention -- the kernel takes g already exp'd, not log_g); beta in
+    // (0,1) too. Include the large_decay-style strong-decay regime
+    // (g close to 0) at least once via the caller's own shape choices --
+    // this helper takes whatever the caller passes.
+    let g_vals: Vec<f32> = (0..b * h).map(|_| rng.random::<f32>() * 0.9 + 0.05).collect();
+    let beta_vals: Vec<f32> = (0..b * h).map(|_| rng.random::<f32>() * 0.9 + 0.05).collect();
+    let state_in = randf(&mut rng, b * h * hk * hv, 1.0);
+
+    let q_buf = new_buffer(&device, &q);
+    let k_buf = new_buffer(&device, &k);
+    let v_buf = new_buffer(&device, &v);
+    let g_buf = new_buffer(&device, &g_vals);
+    let beta_buf = new_buffer(&device, &beta_vals);
+    let state_in_buf = new_buffer(&device, &state_in);
+    let mut state_out_buf = device
+        .new_buffer(b * h * hk * hv * std::mem::size_of::<f32>(), RESOURCE_OPTIONS)
+        .unwrap();
+    let mut out_buf = device
+        .new_buffer(b * h * hv * std::mem::size_of::<f32>(), RESOURCE_OPTIONS)
+        .unwrap();
+
+    call_gdn_decode_step_f32(
+        &device,
+        &encoder,
+        &kernels,
+        b,
+        h,
+        hk,
+        hv,
+        &q_buf,
+        &k_buf,
+        &v_buf,
+        &g_buf,
+        &beta_buf,
+        &state_in_buf,
+        &mut state_out_buf,
+        &mut out_buf,
+    )
+    .unwrap();
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
+
+    let got_out: Vec<f32> = read_to_vec(&out_buf, b * h * hv);
+    let got_state: Vec<f32> = read_to_vec(&state_out_buf, b * h * hk * hv);
+
+    let mut max_out_diff = 0f32;
+    let mut max_state_diff = 0f32;
+    for bh in 0..b * h {
+        let (expected_out, expected_state) = gdn_decode_step_reference(
+            &q[bh * hk..(bh + 1) * hk],
+            &k[bh * hk..(bh + 1) * hk],
+            &v[bh * hv..(bh + 1) * hv],
+            g_vals[bh],
+            beta_vals[bh],
+            &state_in[bh * hk * hv..(bh + 1) * hk * hv],
+            hk,
+            hv,
+        );
+        for j in 0..hv {
+            let diff = (got_out[bh * hv + j] - expected_out[j]).abs();
+            max_out_diff = max_out_diff.max(diff);
+        }
+        for e in 0..hk * hv {
+            let diff = (got_state[bh * hk * hv + e] - expected_state[e]).abs();
+            max_state_diff = max_state_diff.max(diff);
+        }
+    }
+    println!(
+        "gdn_decode_step b={b} h={h} hk={hk} hv={hv}: out_diff={max_out_diff:.8} state_diff={max_state_diff:.8}"
+    );
+    assert!(
+        max_out_diff < 5e-5,
+        "b={b} h={h} hk={hk} hv={hv}: output mismatch, max diff = {max_out_diff}"
+    );
+    assert!(
+        max_state_diff < 5e-5,
+        "b={b} h={h} hk={hk} hv={hv}: state mismatch, max diff = {max_state_diff}"
+    );
+}
+
+#[test]
+fn kernel_gdn_decode_step_matches_scalar_reference_tiny() {
+    // Small, odd shapes -- hv=5 is not a multiple of min(hv,64)'s
+    // threadgroup width, exercising the bounds check on every thread group
+    // boundary, not just the last one.
+    run_gdn_decode_step_and_check(1, 2, 4, 4);
+    run_gdn_decode_step_and_check(1, 3, 7, 5);
+    run_gdn_decode_step_and_check(2, 2, 6, 6);
+}
+
+#[test]
+fn kernel_gdn_decode_step_matches_scalar_reference_production_shape() {
+    // b=1, h=32, hk=128, hv=128 -- the real production shape (confirmed
+    // against the cached qwen36-35b-a3b GGUF's qwen35moe.ssm.* metadata,
+    // ratatoskr/DESIGN.md's fused-kernel Phase 0 section).
+    run_gdn_decode_step_and_check(1, 32, 128, 128);
+}
