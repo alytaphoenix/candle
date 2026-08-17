@@ -4762,6 +4762,20 @@ fn kernel_gdn_chunked_scan_solve_pipeline_loads() {
         .unwrap_or_else(|e| panic!("kernel_gdn_chunked_scan_solve_f32 should load as a Metal compute pipeline: {e}"));
 }
 
+// Phase 3.1b: this fork's first kernel using threadgroup memory and a
+// barrier -- de-risk-spike-before-numeric-work precedent, same as
+// kernel_gdn_chunked_scan_solve_pipeline_loads above.
+#[test]
+fn kernel_gdn_chunked_scan_build_and_solve_pipeline_loads() {
+    let device = device();
+    let kernels = Kernels::new();
+    kernels
+        .load_pipeline(&device, Source::Gdn, "kernel_gdn_chunked_scan_build_and_solve_f32")
+        .unwrap_or_else(|e| {
+            panic!("kernel_gdn_chunked_scan_build_and_solve_f32 should load as a Metal compute pipeline: {e}")
+        });
+}
+
 // Scalar Rust reference: row-by-row forward substitution, matching
 // ratatoskr::qwen3_5_linear_attn_scan::gated_delta_rule_chunked's own
 // tensor-path loop line-by-line (`attn[i,:] = e_i + sum_{k<i} a_mat[i,k] *
@@ -4942,4 +4956,236 @@ fn kernel_gdn_chunked_scan_solve_matches_scalar_reference_strong_decay() {
     }
     println!("gdn_chunked_scan_solve_strong_decay: max_diff={max_diff:.8}");
     assert!(max_diff < 1e-2, "strong-decay solve mismatch, max diff = {max_diff}");
+}
+
+// Phase 3.1b: folds a_mat's construction into the kernel above. Scalar
+// Rust reference builds a_mat via the running-suffix-sum formula
+// (matching the kernel's own math, NOT the tensor path's two-prefix-
+// sum-subtraction form -- this reference and the kernel should agree
+// closely since both use the same summation order; the tensor path's
+// own subtly different order is what the *ratatoskr-level* differential
+// checks separately), then solves via the same row-serial reference as
+// gdn_scan_solve_reference (deliberately independent of the kernel's
+// own column-parallel solve half).
+fn gdn_scan_build_solve_reference(k_c: &[f32], log_g_c: &[f32], beta_c: &[f32], chunk: usize, hk: usize) -> Vec<f32> {
+    let mut a_mat = vec![0f32; chunk * chunk];
+    for j in 0..chunk {
+        let mut acc_g = 0f32;
+        for i in (j + 1)..chunk {
+            acc_g += log_g_c[i];
+            let mut dot = 0f32;
+            for d in 0..hk {
+                dot += k_c[i * hk + d] * k_c[j * hk + d];
+            }
+            a_mat[i * chunk + j] = -beta_c[i] * dot * acc_g.exp();
+        }
+    }
+    gdn_scan_solve_reference(&a_mat, chunk)
+}
+
+fn run_gdn_scan_build_solve_and_check(bhnc: usize, hk: usize) {
+    let device = device();
+    let kernels = Kernels::new();
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
+    let mut rng = rng();
+
+    let chunk = GDN_SCAN_CHUNK;
+    fn randf(rng: &mut impl Rng, n: usize, scale: f32) -> Vec<f32> {
+        (0..n).map(|_| (rng.random::<f32>() - 0.5) * scale).collect()
+    }
+    let k_c = randf(&mut rng, bhnc * chunk * hk, 0.4);
+    // log_g must be <= 0 everywhere (ssm_a * softplus(...), see the
+    // kernel's own doc comment) -- sampled from a realistic negative
+    // range, not just "happens to be negative by luck of the RNG".
+    let log_g_c: Vec<f32> = (0..bhnc * chunk).map(|_| -(rng.random::<f32>() * 0.3 + 0.02)).collect();
+    let beta_c: Vec<f32> = (0..bhnc * chunk).map(|_| rng.random::<f32>() * 0.9 + 0.05).collect();
+
+    let k_c_buf = new_buffer(&device, &k_c);
+    let log_g_buf = new_buffer(&device, &log_g_c);
+    let beta_buf = new_buffer(&device, &beta_c);
+    let attn_buf = device
+        .new_buffer(bhnc * chunk * chunk * std::mem::size_of::<f32>(), RESOURCE_OPTIONS)
+        .unwrap();
+
+    call_gdn_chunked_scan_build_and_solve_f32(
+        &device,
+        &encoder,
+        &kernels,
+        bhnc,
+        hk,
+        &BufferOffset::zero_offset(&k_c_buf),
+        &BufferOffset::zero_offset(&log_g_buf),
+        &BufferOffset::zero_offset(&beta_buf),
+        &attn_buf,
+    )
+    .unwrap();
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
+
+    let got: Vec<f32> = read_to_vec(&attn_buf, bhnc * chunk * chunk);
+    let mut max_diff = 0f32;
+    let mut worst = (0usize, 0usize, 0usize);
+    for p in 0..bhnc {
+        let expected = gdn_scan_build_solve_reference(
+            &k_c[p * chunk * hk..(p + 1) * chunk * hk],
+            &log_g_c[p * chunk..(p + 1) * chunk],
+            &beta_c[p * chunk..(p + 1) * chunk],
+            chunk,
+            hk,
+        );
+        for i in 0..chunk {
+            for j in 0..chunk {
+                let d = (got[p * chunk * chunk + i * chunk + j] - expected[i * chunk + j]).abs();
+                if d > max_diff {
+                    max_diff = d;
+                    worst = (p, i, j);
+                }
+            }
+        }
+    }
+    println!(
+        "gdn_chunked_scan_build_and_solve bhnc={bhnc} hk={hk}: max_diff={max_diff:.8} worst(p,i,j)={worst:?}"
+    );
+    assert!(max_diff < 1e-3, "bhnc={bhnc} hk={hk}: build+solve mismatch, max diff = {max_diff}");
+}
+
+#[test]
+fn kernel_gdn_chunked_scan_build_and_solve_matches_scalar_reference_tiny() {
+    run_gdn_scan_build_solve_and_check(1, 8);
+    run_gdn_scan_build_solve_and_check(3, 16);
+}
+
+#[test]
+fn kernel_gdn_chunked_scan_build_and_solve_matches_scalar_reference_production_shape() {
+    // hk=128 (state_size on both checkpoints); bhnc=96 (35B-A3B MoE) /
+    // 144 (27B dense), matching Phase 3.0's own confirmed shapes.
+    run_gdn_scan_build_solve_and_check(96, 128);
+    run_gdn_scan_build_solve_and_check(144, 128);
+}
+
+// Regression test for the same bug class every other kernel in this
+// file guards against: k_c/log_g_c/beta_c are exactly the kind of
+// tensors (narrow/reshape chains in the tensor path) that could carry
+// a real nonzero byte offset in a future caller.
+#[test]
+fn kernel_gdn_chunked_scan_build_and_solve_respects_nonzero_buffer_offsets() {
+    let device = device();
+    let kernels = Kernels::new();
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
+    let mut rng = rng();
+
+    let (bhnc, hk) = (2usize, 8usize);
+    let chunk = GDN_SCAN_CHUNK;
+    fn randf(rng: &mut impl Rng, n: usize, scale: f32) -> Vec<f32> {
+        (0..n).map(|_| (rng.random::<f32>() - 0.5) * scale).collect()
+    }
+    let k_c = randf(&mut rng, bhnc * chunk * hk, 0.4);
+    let log_g_c: Vec<f32> = (0..bhnc * chunk).map(|_| -(rng.random::<f32>() * 0.3 + 0.02)).collect();
+    let beta_c: Vec<f32> = (0..bhnc * chunk).map(|_| rng.random::<f32>() * 0.9 + 0.05).collect();
+    let decoy_k = randf(&mut rng, bhnc * chunk * hk, 999.0);
+    let decoy_scalar = randf(&mut rng, bhnc * chunk, 999.0);
+
+    let f32_size = std::mem::size_of::<f32>();
+    let k_packed: Vec<f32> = [&decoy_k[..], &k_c[..]].concat();
+    let k_buf = new_buffer(&device, &k_packed);
+    let k_off = BufferOffset { buffer: &k_buf, offset_in_bytes: decoy_k.len() * f32_size };
+
+    let scalar_packed: Vec<f32> = [&decoy_scalar[..], &log_g_c[..], &beta_c[..]].concat();
+    let scalar_buf = new_buffer(&device, &scalar_packed);
+    let log_g_off = BufferOffset { buffer: &scalar_buf, offset_in_bytes: decoy_scalar.len() * f32_size };
+    let beta_off =
+        BufferOffset { buffer: &scalar_buf, offset_in_bytes: (decoy_scalar.len() + log_g_c.len()) * f32_size };
+
+    let attn_buf = device
+        .new_buffer(bhnc * chunk * chunk * f32_size, RESOURCE_OPTIONS)
+        .unwrap();
+
+    call_gdn_chunked_scan_build_and_solve_f32(&device, &encoder, &kernels, bhnc, hk, &k_off, &log_g_off, &beta_off, &attn_buf)
+        .unwrap();
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
+
+    let got: Vec<f32> = read_to_vec(&attn_buf, bhnc * chunk * chunk);
+    let mut max_diff = 0f32;
+    for p in 0..bhnc {
+        let expected = gdn_scan_build_solve_reference(
+            &k_c[p * chunk * hk..(p + 1) * chunk * hk],
+            &log_g_c[p * chunk..(p + 1) * chunk],
+            &beta_c[p * chunk..(p + 1) * chunk],
+            chunk,
+            hk,
+        );
+        for e in 0..chunk * chunk {
+            max_diff = max_diff.max((got[p * chunk * chunk + e] - expected[e]).abs());
+        }
+    }
+    println!("gdn_chunked_scan_build_and_solve_nonzero_offsets: max_diff={max_diff:.8}");
+    assert!(max_diff < 1e-3, "nonzero-offset build+solve mismatch, max diff = {max_diff}");
+}
+
+// Adversarial: strong decay (log_g near its most-negative realistic
+// range) -- exercises the running-suffix-sum accumulator across the
+// full 63-entry range for thread 0's column, the longest chain in the
+// kernel, where the design's own numerics note (drift vs. the tensor
+// path's two-prefix-sum form) would show up first if it were more than
+// benign reassociation.
+#[test]
+fn kernel_gdn_chunked_scan_build_and_solve_matches_scalar_reference_strong_decay() {
+    let device = device();
+    let kernels = Kernels::new();
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
+    let mut rng = rng();
+
+    let (bhnc, hk) = (2usize, 128usize);
+    let chunk = GDN_SCAN_CHUNK;
+    fn randf(rng: &mut impl Rng, n: usize, scale: f32) -> Vec<f32> {
+        (0..n).map(|_| (rng.random::<f32>() - 0.5) * scale).collect()
+    }
+    let k_c = randf(&mut rng, bhnc * chunk * hk, 0.4);
+    // Real large_decay regime (matching qwen3_5_linear_attn_scan.rs's
+    // own run_chunked_large_decay convention): g = exp(-6.72).
+    let log_g_c: Vec<f32> = vec![-6.72f32; bhnc * chunk];
+    let beta_c: Vec<f32> = vec![0.65f32; bhnc * chunk];
+
+    let k_buf = new_buffer(&device, &k_c);
+    let log_g_buf = new_buffer(&device, &log_g_c);
+    let beta_buf = new_buffer(&device, &beta_c);
+    let attn_buf = device
+        .new_buffer(bhnc * chunk * chunk * std::mem::size_of::<f32>(), RESOURCE_OPTIONS)
+        .unwrap();
+
+    call_gdn_chunked_scan_build_and_solve_f32(
+        &device,
+        &encoder,
+        &kernels,
+        bhnc,
+        hk,
+        &BufferOffset::zero_offset(&k_buf),
+        &BufferOffset::zero_offset(&log_g_buf),
+        &BufferOffset::zero_offset(&beta_buf),
+        &attn_buf,
+    )
+    .unwrap();
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
+
+    let got: Vec<f32> = read_to_vec(&attn_buf, bhnc * chunk * chunk);
+    let mut max_diff = 0f32;
+    for p in 0..bhnc {
+        let expected = gdn_scan_build_solve_reference(
+            &k_c[p * chunk * hk..(p + 1) * chunk * hk],
+            &log_g_c[p * chunk..(p + 1) * chunk],
+            &beta_c[p * chunk..(p + 1) * chunk],
+            chunk,
+            hk,
+        );
+        for e in 0..chunk * chunk {
+            max_diff = max_diff.max((got[p * chunk * chunk + e] - expected[e]).abs());
+        }
+    }
+    println!("gdn_chunked_scan_build_and_solve_strong_decay: max_diff={max_diff:.8}");
+    assert!(max_diff < 1e-2, "strong-decay build+solve mismatch, max diff = {max_diff}");
 }
