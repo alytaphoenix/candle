@@ -370,19 +370,45 @@ kernel void kernel_gdn_chunked_scan_solve_f32(
 // not a separate assignment for build vs. solve. Thread j builds its
 // own column's strictly-lower entries (i = j+1..CHUNK-1) using a
 // single scalar running accumulator (`acc_g`) and a scalar dot-product
-// accumulator -- **no per-thread array anywhere in this kernel**, the
-// hard constraint 3.1a's own miscompilation finding established for
-// this crate. a_mat lands in a single 16KB threadgroup tile (the only
-// shared state this kernel needs -- k_c/log_g_c/beta_c stay
-// device-resident and are read via uniform/cache-friendly access
-// patterns, not staged). Exactly **one** threadgroup_barrier, after
-// every thread's build loop completes and before any solve read --
-// dispatch is deliberately sized to exactly (CHUNK, bhnc) threads
-// (grid_dims == group_dims-multiple, see the Rust wrapper), so **no
-// thread ever needs a bounds-check return before the barrier** (an
-// early return before a barrier is undefined behavior -- not every
-// thread would reach it -- so this kernel has none, unlike every
-// other kernel in this file, deliberately).
+// accumulator -- **no per-thread array anywhere in this kernel**. This
+// is a hard constraint, not a preference: 3.1a's first implementation
+// held a 64-entry `float x[64]` per thread and was found to silently
+// miscompile (produce zeros for most rows) at that exact size on this
+// Metal toolchain -- confirmed size-dependent, not a logic bug, by
+// shrinking to 4 in isolation, where identical logic was correct. See
+// yggdrasil/ratatoskr/DESIGN.md's "standing risk for future kernel
+// work in this fork" paragraph for the full writeup -- any kernel in
+// this crate wanting a per-thread array above roughly 32-64 entries
+// should differential-test at the real target size specifically, the
+// same way this one did, not assume register-residency holds.
+//
+// a_mat lands in a single 16KB threadgroup tile (the only shared state
+// this kernel needs -- k_c/log_g_c/beta_c stay device-resident and are
+// read via uniform/cache-friendly access patterns, not staged).
+// Exactly **one** threadgroup_barrier, after every thread's build loop
+// completes and before any solve read -- dispatch is deliberately
+// sized to exactly (CHUNK, bhnc) threads (grid_dims == group_dims-
+// multiple, see the Rust wrapper), so **no thread ever needs a
+// bounds-check return before the barrier** (an early return before a
+// barrier is undefined behavior -- not every thread would reach it --
+// so this kernel has none, unlike every other kernel in this file,
+// deliberately).
+//
+// **This is a real landmine for anyone extending this kernel, not
+// just an absence to note in passing.** Every OTHER kernel in this
+// file uses `if (idx >= bound) { return; }`, including the literally
+// adjacent kernel_gdn_chunked_scan_solve_f32 just above this one --
+// copying that idiom into a barrier-containing kernel out of habit is
+// undefined behavior, not merely redundant. The two halves of a
+// combined check are not equally dangerous here: with this kernel's
+// own `group_dims.height == 1`, `p` (the problem index) is
+// threadgroup-uniform (every thread in a group has the same `p`), so a
+// `p`-only early return would be legal; `j` (the column) varies within
+// a group, so a `j`-only (or combined) early return before the barrier
+// is the real hazard. If a future variant of this kernel ever needs
+// non-exact dispatch dimensions, do not add the combined check back
+// in -- restructure so any skipped work still falls through to the
+// barrier (skip the work, never `return`).
 //
 // Numerics note for verification: this kernel's a_mat differs from
 // the tensor path's own a_mat by ordinary f32 summation-order drift
@@ -392,8 +418,12 @@ kernel void kernel_gdn_chunked_scan_solve_f32(
 // The production-scale differential is the arbiter, same as every
 // other phase in this design.
 struct gdn_scan_build_solve_args {
-    uint bhnc;
-    uint hk; // head_k_dim (k_c's last dimension)
+    uint hk; // head_k_dim (k_c's last dimension) -- bhnc is NOT a field
+             // here: the kernel never reads it (dispatch is sized to
+             // exactly (CHUNK, bhnc) threads, so there is nothing for a
+             // bhnc bounds check to do -- see the "no bounds-check
+             // return" note above). Keeping an unused field would be
+             // dead GPU-side state with no compiler warning to catch it.
 };
 
 kernel void kernel_gdn_chunked_scan_build_and_solve_f32(

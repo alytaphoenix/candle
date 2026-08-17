@@ -457,8 +457,7 @@ pub fn call_gdn_chunked_scan_solve_f32(
 
 #[repr(C)]
 struct GdnScanBuildSolveArgs {
-    bhnc: u32,
-    hk: u32,
+    hk: u32, // bhnc is deliberately not a field -- the kernel never reads it, see gdn.metal
 }
 
 impl EncoderParam for GdnScanBuildSolveArgs {
@@ -507,7 +506,7 @@ pub fn call_gdn_chunked_scan_build_and_solve_f32(
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "gdn_chunked_scan_build_and_solve bhnc={bhnc} hk={hk}");
 
-    let args = GdnScanBuildSolveArgs { bhnc: bhnc as u32, hk: hk as u32 };
+    let args = GdnScanBuildSolveArgs { hk: hk as u32 };
     set_params!(encoder, (k_c, log_g_c, beta_c, Output::new(attn), args));
 
     let grid_dims = MTLSize {
