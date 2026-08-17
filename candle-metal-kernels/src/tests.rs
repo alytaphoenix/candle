@@ -5189,3 +5189,85 @@ fn kernel_gdn_chunked_scan_build_and_solve_matches_scalar_reference_strong_decay
     println!("gdn_chunked_scan_build_and_solve_strong_decay: max_diff={max_diff:.8}");
     assert!(max_diff < 1e-2, "strong-decay build+solve mismatch, max diff = {max_diff}");
 }
+
+// Standalone wall-clock microbench at production shape (mirrors
+// sequential_step_standalone_microbench_at_production_shapes's own
+// precedent) -- a standing reference point for this kernel's own
+// absolute cost, for catching a future regression.
+//
+// 2026-08-17 investigation, recorded here rather than left only in
+// conversation: this kernel's build phase re-reads k_c from device
+// memory redundantly (up to 63x per row). Measured directly (an
+// interleaved calibration against a same-address-always variant, 4
+// runs, tight and reproducible at 66.5-67.5%) -- real cost, not noise,
+// contradicting an initial "small working set, cache-absorbed"
+// prediction. A structural fix was designed, implemented, and
+// differential-verified correct (stage k_c into a second threadgroup
+// tile; move a_mat to a device scratch buffer to make room, since the
+// two tiles together exceed this crate's confirmed 32768-byte
+// maxThreadgroupMemoryLength at hk=128) -- then measured and found to
+// be a net REGRESSION: ~4.7-4.9ms/call versus this kernel's own
+// ~2.5ms/call, roughly double. The fix's own cost (a `mem_device`
+// barrier -- device-memory-wide visibility, not just on-chip
+// threadgroup synchronization -- plus a larger per-threadgroup
+// footprint likely reducing how many threadgroups run concurrently)
+// exceeded what it saved. Reverted; this kernel's redundant reads are
+// real but not worth eliminating given the only structurally-correct
+// fix available. Full writeup in yggdrasil/ratatoskr/DESIGN.md.
+#[test]
+fn kernel_gdn_chunked_scan_build_and_solve_standalone_microbench_at_production_shape() {
+    let device = device();
+    let kernels = Kernels::new();
+    let mut rng = rng();
+
+    let (bhnc, hk) = (96usize, 128usize);
+    let chunk = GDN_SCAN_CHUNK;
+    fn randf(rng: &mut impl Rng, n: usize, scale: f32) -> Vec<f32> {
+        (0..n).map(|_| (rng.random::<f32>() - 0.5) * scale).collect()
+    }
+    let k_c = randf(&mut rng, bhnc * chunk * hk, 0.4);
+    let log_g_c: Vec<f32> = (0..bhnc * chunk).map(|_| -(rng.random::<f32>() * 0.3 + 0.02)).collect();
+    let beta_c: Vec<f32> = (0..bhnc * chunk).map(|_| rng.random::<f32>() * 0.9 + 0.05).collect();
+
+    let k_buf = new_buffer(&device, &k_c);
+    let log_g_buf = new_buffer(&device, &log_g_c);
+    let beta_buf = new_buffer(&device, &beta_c);
+    let attn_buf = device
+        .new_buffer(bhnc * chunk * chunk * std::mem::size_of::<f32>(), RESOURCE_OPTIONS)
+        .unwrap();
+
+    const WARMUP: usize = 8;
+    const TOTAL_CALLS: usize = 150; // matches 35B's real DeltaNet-layers x windows count
+    for _ in 0..WARMUP {
+        let commands = commands(&device);
+        let encoder = commands.command_encoder().unwrap();
+        call_gdn_chunked_scan_build_and_solve_f32(
+            &device, &encoder, &kernels, bhnc, hk,
+            &BufferOffset::zero_offset(&k_buf), &BufferOffset::zero_offset(&log_g_buf),
+            &BufferOffset::zero_offset(&beta_buf), &attn_buf,
+        )
+        .unwrap();
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+    }
+
+    let start = std::time::Instant::now();
+    for _ in 0..TOTAL_CALLS {
+        let commands = commands(&device);
+        let encoder = commands.command_encoder().unwrap();
+        call_gdn_chunked_scan_build_and_solve_f32(
+            &device, &encoder, &kernels, bhnc, hk,
+            &BufferOffset::zero_offset(&k_buf), &BufferOffset::zero_offset(&log_g_buf),
+            &BufferOffset::zero_offset(&beta_buf), &attn_buf,
+        )
+        .unwrap();
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+    }
+    let elapsed = start.elapsed();
+    let per_call = elapsed / TOTAL_CALLS as u32;
+    println!(
+        "kernel_gdn_chunked_scan_build_and_solve_standalone_microbench_at_production_shape: \
+         bhnc={bhnc} hk={hk} {TOTAL_CALLS} calls: total={elapsed:?} per_call={per_call:?}"
+    );
+}
