@@ -378,9 +378,14 @@ pub fn call_gdn_decay_beta_gate_f32(
 
 /// Chunk size for `call_gdn_chunked_scan_solve_f32` -- must match
 /// `metal_src/gdn.metal`'s `GDN_SCAN_CHUNK` and ratatoskr's own
-/// `CHUNK_SIZE` (`qwen3_5_linear_attn_scan.rs`) exactly; the kernel hardcodes
-/// this as a compile-time constant so its per-thread solve loop can be
-/// fully unrolled (see the kernel's own doc comment).
+/// `CHUNK_SIZE` (`qwen3_5_linear_attn_scan.rs`) exactly. The kernel
+/// hardcodes this as a compile-time constant for the dispatch-grid/
+/// buffer-stride arithmetic, not for register-array unrolling -- an
+/// earlier version of this kernel *did* hold a compile-time-sized
+/// per-thread array for exactly that reason, and was found to
+/// miscompile at this size (see the kernel's own doc comment for the
+/// real bug and the fix, which deliberately avoids a per-thread array
+/// of this size entirely).
 pub const GDN_SCAN_CHUNK: usize = 64;
 
 #[repr(C)]
